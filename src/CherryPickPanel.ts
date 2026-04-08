@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { GitService, CommitInfo } from './GitService';
+import * as path from 'path';
+import { GitService, CommitInfo, CherryPickConflict } from './GitService';
 
 export class CherryPickPanel {
   public static currentPanel: CherryPickPanel | undefined;
@@ -8,6 +9,7 @@ export class CherryPickPanel {
   private readonly _panel: vscode.WebviewPanel;
   private readonly _git: GitService;
   private _disposables: vscode.Disposable[] = [];
+  private _conflictState: CherryPickConflict | undefined;
 
   public static createOrShow(extensionUri: vscode.Uri, git: GitService) {
     const column = vscode.window.activeTextEditor
@@ -71,25 +73,62 @@ export class CherryPickPanel {
       }
 
       case 'cherryPick': {
-        const { newBranch, baseBranch, commits, push } = msg;
+        const { targetBranch, commits, push } = msg;
 
-        if (!newBranch || newBranch.trim() === '') {
-          this._panel.webview.postMessage({ command: 'error', message: 'Feature branch name is required.' });
-          return;
-        }
         if (!commits || commits.length === 0) {
           this._panel.webview.postMessage({ command: 'error', message: 'Select at least one commit.' });
           return;
         }
-        if (this._git.branchExists(newBranch)) {
-          this._panel.webview.postMessage({ command: 'error', message: `Branch "${newBranch}" already exists. Choose a different name.` });
+        if (!targetBranch) {
+          this._panel.webview.postMessage({ command: 'error', message: 'Target branch is required.' });
           return;
         }
 
-        this._panel.webview.postMessage({ command: 'progress', message: `Creating branch "${newBranch}" from "${baseBranch}" and cherry-picking ${commits.length} commit(s)...` });
+        this._panel.webview.postMessage({ command: 'progress', message: `Cherry-picking ${commits.length} commit(s) onto "${targetBranch}"...` });
 
-        const result = await this._git.cherryPickCommits(newBranch, baseBranch, commits, push);
-        this._panel.webview.postMessage({ command: 'cherryPickDone', result });
+        const result = await this._git.cherryPickCommits(targetBranch, commits, push);
+        this._handleCherryPickResult(result);
+        break;
+      }
+
+      case 'openConflictFile': {
+        const absPath = path.join(this._git.repoPath, msg.filePath);
+        const uri = vscode.Uri.file(absPath);
+        vscode.window.showTextDocument(uri, { preview: false });
+        break;
+      }
+
+      case 'continueResolve': {
+        if (!this._conflictState) {
+          this._panel.webview.postMessage({ command: 'error', message: 'No active conflict to continue.' });
+          return;
+        }
+        this._panel.webview.postMessage({ command: 'progress', message: 'Continuing cherry-pick...' });
+        try {
+          const result = this._git.continueCherryPick(this._conflictState);
+          this._handleCherryPickResult(result);
+        } catch (err: any) {
+          this._panel.webview.postMessage({ command: 'error', message: err.message });
+        }
+        break;
+      }
+
+      case 'abortResolve': {
+        if (!this._conflictState) {
+          this._panel.webview.postMessage({ command: 'error', message: 'No active conflict to abort.' });
+          return;
+        }
+        const abortResult = this._git.abortCherryPick(this._conflictState);
+        this._conflictState = undefined;
+        this._panel.webview.postMessage({ command: 'conflictResolved' });
+        this._panel.webview.postMessage({ command: 'cherryPickDone', result: abortResult });
+        break;
+      }
+
+      case 'refreshConflicts': {
+        if (!this._conflictState) { return; }
+        const files = this._git.getConflictedFiles();
+        this._panel.webview.postMessage({ command: 'conflictsRefreshed', files });
         break;
       }
 
@@ -128,6 +167,24 @@ export class CherryPickPanel {
         this._refresh();
         break;
       }
+    }
+  }
+
+  private _handleCherryPickResult(result: import('./GitService').CherryPickResult | import('./GitService').CherryPickConflict) {
+    if (result.status === 'conflict') {
+      this._conflictState = result;
+      this._panel.webview.postMessage({
+        command: 'conflictDetected',
+        conflictedFiles: result.conflictedFiles,
+        commitHash: result.currentCommitHash,
+        pickedSoFar: result.pickedSoFar,
+        totalCommits: result.allCommits.length,
+        targetBranch: result.targetBranch,
+      });
+    } else {
+      this._conflictState = undefined;
+      this._panel.webview.postMessage({ command: 'conflictResolved' });
+      this._panel.webview.postMessage({ command: 'cherryPickDone', result });
     }
   }
 
@@ -377,6 +434,27 @@ export class CherryPickPanel {
     white-space: nowrap;
   }
   .btn-view-changes:hover { opacity: 0.85; }
+  /* Conflict resolution */
+  #conflict-section { display: none; }
+  .conflict-msg { font-size: 0.88em; opacity: 0.85; line-height: 1.5; }
+  .conflict-file-list {
+    max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: var(--radius);
+  }
+  .conflict-file-item {
+    padding: 7px 12px;
+    font-size: 0.85em;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+  }
+  .conflict-file-item:last-child { border-bottom: none; }
+  .conflict-file-item:hover { background: var(--vscode-list-hoverBackground); }
+  .conflict-icon { color: #d29922; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -445,6 +523,18 @@ export class CherryPickPanel {
     <button class="btn-primary" id="btnCherryPickPush" onclick="doCherryPick(true)">
       🍒 Cherry-Pick, Create &amp; Push
     </button>
+  </div>
+</div>
+
+<!-- Conflict Resolution -->
+<div class="card" id="conflict-section">
+  <h2>Conflict Resolution</h2>
+  <p class="conflict-msg" id="conflict-msg"></p>
+  <div class="conflict-file-list" id="conflictFileList"></div>
+  <div class="row" style="margin-top:4px;">
+    <button class="btn-secondary" onclick="refreshConflicts()">Refresh</button>
+    <button class="btn-success" onclick="continueResolve()">Continue Cherry-Pick</button>
+    <button class="btn-danger" onclick="abortResolve()">Abort</button>
   </div>
 </div>
 
@@ -676,10 +766,9 @@ window.addEventListener('message', e => {
     case 'cherryPickDone': {
       setBusy(false);
       const r = msg.result;
-      if (r.success) {
+      if (r.status === 'success') {
         showStatus(
-          '✅ Branch "' + r.branch + '" created with ' + r.pickedCount + ' cherry-picked commit(s).' +
-          (r.conflicts.length ? ' ⚠️ Skipped: ' + r.conflicts.join(', ') : ''),
+          '✅ Branch "' + r.branch + '" created with ' + r.pickedCount + ' cherry-picked commit(s).',
           'success'
         );
       } else {
@@ -687,6 +776,16 @@ window.addEventListener('message', e => {
       }
       break;
     }
+    case 'conflictDetected':
+      showConflictUI(msg);
+      setBusy(false);
+      break;
+    case 'conflictsRefreshed':
+      renderConflictFiles(msg.files);
+      break;
+    case 'conflictResolved':
+      hideConflictUI();
+      break;
     case 'commitFilesLoaded':
       renderFileChanges(msg.hash, msg.files);
       break;
@@ -696,6 +795,56 @@ window.addEventListener('message', e => {
       break;
   }
 });
+
+// ── Conflict resolution ──
+
+function showConflictUI(data) {
+  document.getElementById('conflict-section').style.display = 'flex';
+  document.getElementById('action-section').style.display = 'none';
+  document.getElementById('conflict-msg').textContent =
+    'Conflict on commit ' + data.commitHash.substring(0, 7) +
+    ' (' + data.pickedSoFar + ' of ' + data.totalCommits + ' picked so far). ' +
+    'Open the files below to resolve conflicts, then click Continue.';
+  renderConflictFiles(data.conflictedFiles);
+  hideStatus();
+}
+
+function renderConflictFiles(files) {
+  var list = document.getElementById('conflictFileList');
+  if (!files.length) {
+    list.innerHTML = '<div style="padding:8px;opacity:0.5;font-size:0.85em;text-align:center;">All conflicts resolved. Click Continue.</div>';
+    return;
+  }
+  list.innerHTML = files.map(function(f) {
+    var q = "&apos;";
+    return '<div class="conflict-file-item" onclick="openConflictFile(' + q + escHtml(f) + q + ')">'
+      + '<span class="conflict-icon">!</span>'
+      + '<span>' + escHtml(f) + '</span>'
+      + '</div>';
+  }).join('');
+}
+
+function openConflictFile(filePath) {
+  vscode.postMessage({ command: 'openConflictFile', filePath: filePath });
+}
+
+function refreshConflicts() {
+  vscode.postMessage({ command: 'refreshConflicts' });
+}
+
+function continueResolve() {
+  showStatus('Continuing cherry-pick...', 'progress');
+  vscode.postMessage({ command: 'continueResolve' });
+}
+
+function abortResolve() {
+  showStatus('Aborting cherry-pick...', 'progress');
+  vscode.postMessage({ command: 'abortResolve' });
+}
+
+function hideConflictUI() {
+  document.getElementById('conflict-section').style.display = 'none';
+}
 
 // ── View file changes ──
 
@@ -738,6 +887,10 @@ initSearchSelects();
   }
 
   public dispose() {
+    if (this._conflictState) {
+      this._git.abortCherryPick(this._conflictState);
+      this._conflictState = undefined;
+    }
     CherryPickPanel.currentPanel = undefined;
     this._panel.dispose();
     this._disposables.forEach(d => d.dispose());

@@ -18,15 +18,30 @@ export interface CommitFileChange {
 }
 
 export interface CherryPickResult {
-  success: boolean;
-  branch: string;
+  status: 'success' | 'error';
+  targetBranch: string;
   pickedCount: number;
-  conflicts: string[];
   error?: string;
 }
 
+export interface CherryPickConflict {
+  status: 'conflict';
+  conflictedFiles: string[];
+  currentCommitHash: string;
+  currentCommitIndex: number;
+  allCommits: string[];
+  targetBranch: string;
+  originalBranch: string;
+  push: boolean;
+  pickedSoFar: number;
+}
+
 export class GitService {
-  constructor(private repoPath: string) {}
+  public readonly repoPath: string;
+
+  constructor(repoPath: string) {
+    this.repoPath = repoPath;
+  }
 
   private run(cmd: string): string {
     try {
@@ -146,78 +161,119 @@ export class GitService {
   }
 
   /**
-   * Create a new branch from baseBranch, then cherry-pick the given commits onto it.
+   * Cherry-pick commits directly onto the target branch.
+   * Pauses on conflict instead of aborting, returning a CherryPickConflict state.
    */
   async cherryPickCommits(
-    newBranchName: string,
-    baseBranch: string,
-    commits: string[], // array of full commit hashes, oldest-first
+    targetBranch: string,
+    commits: string[],
     push: boolean
-  ): Promise<CherryPickResult> {
-    const conflicts: string[] = [];
+  ): Promise<CherryPickResult | CherryPickConflict> {
     const originalBranch = this.getCurrentBranch();
 
     try {
-      // Ensure base branch is up to date
-      try { this.run(`git fetch origin "${baseBranch}" --quiet`); } catch {}
+      try { this.run(`git fetch origin "${targetBranch}" --quiet`); } catch {}
+      // Checkout the target branch directly
+      this.run(`git checkout "${targetBranch}"`);
+      // Pull latest to avoid conflicts with remote
+      try { this.run(`git pull origin "${targetBranch}" --quiet`); } catch {}
 
-      const resolvedBase = this.resolveToSha(baseBranch);
+      return this._pickCommitsFrom(0, commits, targetBranch, originalBranch, push, 0);
+    } catch (err: any) {
+      try { this.run(`git cherry-pick --abort`); } catch {}
+      try { this.run(`git checkout "${originalBranch}"`); } catch {}
+      return { status: 'error', targetBranch, pickedCount: 0, error: err.message };
+    }
+  }
 
-      // Create and checkout new branch from baseBranch
-      this.run(`git checkout -b "${newBranchName}" "${resolvedBase}"`);
-
-      // Cherry-pick each commit
-      for (const hash of commits) {
-        try {
-          this.run(`git cherry-pick ${hash}`);
-        } catch (err: any) {
-          // Abort the cherry-pick and record conflict
-          try { this.run('git cherry-pick --abort'); } catch {}
-          conflicts.push(hash.substring(0, 7));
-          // Continue with remaining commits by skipping this one
-          // We'll re-cherry-pick but skip conflict ones
-        }
-      }
-
-      if (conflicts.length > 0) {
-        // Checkout back and delete the partial branch
-        this.run(`git checkout "${originalBranch}"`);
-        try { this.run(`git branch -D "${newBranchName}"`); } catch {}
+  /**
+   * Internal: pick commits starting from a given index. Returns conflict state if one is hit.
+   */
+  private _pickCommitsFrom(
+    startIndex: number,
+    allCommits: string[],
+    targetBranch: string,
+    originalBranch: string,
+    push: boolean,
+    pickedSoFar: number
+  ): CherryPickResult | CherryPickConflict {
+    for (let i = startIndex; i < allCommits.length; i++) {
+      try {
+        this.run(`git cherry-pick ${allCommits[i]}`);
+        pickedSoFar++;
+      } catch {
+        // Conflict — don't abort, let user resolve
+        const conflictedFiles = this.getConflictedFiles();
         return {
-          success: false,
-          branch: newBranchName,
-          pickedCount: 0,
-          conflicts,
-          error: `Cherry-pick conflicts detected on commits: ${conflicts.join(', ')}. Resolve conflicts manually or deselect those commits.`,
+          status: 'conflict',
+          conflictedFiles,
+          currentCommitHash: allCommits[i],
+          currentCommitIndex: i,
+          allCommits,
+          targetBranch,
+          originalBranch,
+          push,
+          pickedSoFar,
         };
       }
+    }
 
-      // Push if requested
-      if (push) {
-        this.run(`git push -u origin "${newBranchName}"`);
-      }
+    // All commits picked successfully
+    if (push) {
+      this.run(`git push origin "${targetBranch}"`);
+    }
+    this.run(`git checkout "${originalBranch}"`);
+    return { status: 'success', targetBranch, pickedCount: pickedSoFar };
+  }
 
-      // Go back to original branch
-      this.run(`git checkout "${originalBranch}"`);
+  /**
+   * Continue cherry-pick after user resolves conflicts.
+   * Stages all files, continues the cherry-pick, then processes remaining commits.
+   */
+  continueCherryPick(state: CherryPickConflict): CherryPickResult | CherryPickConflict {
+    try {
+      this.run('git add -A');
+      execSync('git cherry-pick --continue', {
+        cwd: this.repoPath,
+        encoding: 'utf8',
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env, GIT_EDITOR: 'true' },
+      });
 
-      return {
-        success: true,
-        branch: newBranchName,
-        pickedCount: commits.length - conflicts.length,
-        conflicts,
-      };
+      return this._pickCommitsFrom(
+        state.currentCommitIndex + 1,
+        state.allCommits,
+        state.targetBranch,
+        state.originalBranch,
+        state.push,
+        state.pickedSoFar + 1
+      );
     } catch (err: any) {
-      // Cleanup on unexpected error
-      try { this.run(`git checkout "${originalBranch}"`); } catch {}
-      try { this.run(`git cherry-pick --abort`); } catch {}
-      try { this.run(`git branch -D "${newBranchName}"`); } catch {}
-      return {
-        success: false,
-        branch: newBranchName,
-        pickedCount: 0,
-        conflicts,
-        error: err.message,
-      };
+      // cherry-pick --continue failed, probably unresolved conflicts remain
+      const conflictedFiles = this.getConflictedFiles();
+      if (conflictedFiles.length > 0) {
+        return { ...state, conflictedFiles };
+      }
+      throw new Error(err.stderr?.trim() || err.message);
+    }
+  }
+
+  /**
+   * Abort cherry-pick, reset the target branch, and go back to original branch.
+   */
+  abortCherryPick(state: CherryPickConflict): CherryPickResult {
+    try { this.run('git cherry-pick --abort'); } catch {}
+    try { this.run(`git checkout "${state.originalBranch}"`); } catch {}
+    return { status: 'error', targetBranch: state.targetBranch, pickedCount: 0, error: 'Cherry-pick aborted by user.' };
+  }
+
+  getConflictedFiles(): string[] {
+    try {
+      const out = this.run('git diff --name-only --diff-filter=U');
+      if (!out) { return []; }
+      return out.split('\n').filter(Boolean);
+    } catch {
+      return [];
     }
   }
 
