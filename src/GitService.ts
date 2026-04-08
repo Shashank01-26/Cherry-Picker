@@ -12,6 +12,11 @@ export interface CommitInfo {
   relativeDate: string;
 }
 
+export interface CommitFileChange {
+  status: string;
+  path: string;
+}
+
 export interface CherryPickResult {
   success: boolean;
   branch: string;
@@ -66,6 +71,8 @@ export class GitService {
 
   getRemoteBranches(): string[] {
     try {
+      // Fetch latest branch list from remote
+      try { this.run('git fetch origin --prune --quiet'); } catch {}
       const out = this.run("git branch -r --format='%(refname:short)'");
       return out
         .split('\n')
@@ -89,11 +96,14 @@ export class GitService {
    */
   getCommitsBetween(sourceBranch: string, targetBranch: string): CommitInfo[] {
     // Make sure we have latest info
-    try { this.run(`git fetch origin ${sourceBranch} --quiet`); } catch {}
-    try { this.run(`git fetch origin ${targetBranch} --quiet`); } catch {}
+    try { this.run(`git fetch origin "${sourceBranch}" --quiet`); } catch {}
+    try { this.run(`git fetch origin "${targetBranch}" --quiet`); } catch {}
+
+    const sourceSha = this.resolveToSha(sourceBranch);
+    const targetSha = this.resolveToSha(targetBranch);
 
     const fmt = '%H|%h|%s|%an|%ad|%ar';
-    const cmd = `git log ${sourceBranch} ^${targetBranch} --format="${fmt}" --date=short --no-merges`;
+    const cmd = `git log ${sourceSha} ^${targetSha} --format="${fmt}" --date=short --no-merges`;
     const out = this.run(cmd);
 
     if (!out) return [];
@@ -104,9 +114,31 @@ export class GitService {
     }).filter(c => c.hash);
   }
 
+  /**
+   * Resolves a branch name to its commit SHA using fully-qualified ref paths
+   * (refs/heads/... or refs/remotes/origin/...) so git never confuses
+   * branch names with file paths, regardless of slashes or special chars.
+   */
+  private resolveToSha(branch: string): string {
+    // Try local branch first (refs/heads/...)
+    try {
+      return this.run(`git rev-parse --verify refs/heads/${branch}`);
+    } catch {}
+    // Try remote tracking branch (refs/remotes/origin/...)
+    try {
+      return this.run(`git rev-parse --verify refs/remotes/origin/${branch}`);
+    } catch {}
+    // Fallback: maybe it's already a SHA or tag
+    try {
+      return this.run(`git rev-parse --verify ${branch}`);
+    } catch {
+      throw new Error(`Cannot resolve branch "${branch}". Make sure it exists locally or on the remote.`);
+    }
+  }
+
   branchExists(branch: string): boolean {
     try {
-      this.run(`git rev-parse --verify ${branch}`);
+      this.resolveToSha(branch);
       return true;
     } catch {
       return false;
@@ -127,10 +159,12 @@ export class GitService {
 
     try {
       // Ensure base branch is up to date
-      try { this.run(`git fetch origin ${baseBranch} --quiet`); } catch {}
+      try { this.run(`git fetch origin "${baseBranch}" --quiet`); } catch {}
+
+      const resolvedBase = this.resolveToSha(baseBranch);
 
       // Create and checkout new branch from baseBranch
-      this.run(`git checkout -b ${newBranchName} ${baseBranch}`);
+      this.run(`git checkout -b "${newBranchName}" "${resolvedBase}"`);
 
       // Cherry-pick each commit
       for (const hash of commits) {
@@ -147,8 +181,8 @@ export class GitService {
 
       if (conflicts.length > 0) {
         // Checkout back and delete the partial branch
-        this.run(`git checkout ${originalBranch}`);
-        try { this.run(`git branch -D ${newBranchName}`); } catch {}
+        this.run(`git checkout "${originalBranch}"`);
+        try { this.run(`git branch -D "${newBranchName}"`); } catch {}
         return {
           success: false,
           branch: newBranchName,
@@ -160,11 +194,11 @@ export class GitService {
 
       // Push if requested
       if (push) {
-        this.run(`git push -u origin ${newBranchName}`);
+        this.run(`git push -u origin "${newBranchName}"`);
       }
 
       // Go back to original branch
-      this.run(`git checkout ${originalBranch}`);
+      this.run(`git checkout "${originalBranch}"`);
 
       return {
         success: true,
@@ -174,9 +208,9 @@ export class GitService {
       };
     } catch (err: any) {
       // Cleanup on unexpected error
-      try { this.run(`git checkout ${originalBranch}`); } catch {}
+      try { this.run(`git checkout "${originalBranch}"`); } catch {}
       try { this.run(`git cherry-pick --abort`); } catch {}
-      try { this.run(`git branch -D ${newBranchName}`); } catch {}
+      try { this.run(`git branch -D "${newBranchName}"`); } catch {}
       return {
         success: false,
         branch: newBranchName,
@@ -188,7 +222,24 @@ export class GitService {
   }
 
   async pushBranch(branchName: string): Promise<void> {
-    await this.runAsync(`git push -u origin ${branchName}`);
+    await this.runAsync(`git push -u origin "${branchName}"`);
+  }
+
+  getCommitFiles(hash: string): CommitFileChange[] {
+    const out = this.run(`git diff-tree --no-commit-id --name-status -r ${hash}`);
+    if (!out) { return []; }
+    return out.split('\n').map(line => {
+      const [status, ...pathParts] = line.split('\t');
+      return { status: status.trim(), path: pathParts.join('\t').trim() };
+    }).filter(f => f.path);
+  }
+
+  showFileAtCommit(ref: string, filePath: string): string {
+    try {
+      return this.run(`git show ${ref}:${filePath}`);
+    } catch {
+      return '';
+    }
   }
 
   getRepoName(): string {

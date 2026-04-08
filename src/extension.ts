@@ -19,6 +19,16 @@ export function activate(context: vscode.ExtensionContext) {
     return;
   }
 
+  // Content provider for viewing file diffs at specific commits
+  const gitContentProvider = vscode.workspace.registerTextDocumentContentProvider('cherry-picker-git', {
+    provideTextDocumentContent(uri: vscode.Uri): string {
+      const ref = uri.query;
+      const filePath = uri.path.substring(1); // remove leading /
+      return git.showFileAtCommit(ref, filePath);
+    }
+  });
+  context.subscriptions.push(gitContentProvider);
+
   // Sidebar tree view
   const treeProvider = new BranchTreeProvider(git);
   const treeView = vscode.window.createTreeView('cherry-picker.branchView', {

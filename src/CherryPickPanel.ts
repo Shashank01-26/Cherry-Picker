@@ -93,6 +93,25 @@ export class CherryPickPanel {
         break;
       }
 
+      case 'getCommitFiles': {
+        try {
+          const files = this._git.getCommitFiles(msg.hash);
+          this._panel.webview.postMessage({ command: 'commitFilesLoaded', hash: msg.hash, files });
+        } catch (err: any) {
+          this._panel.webview.postMessage({ command: 'error', message: err.message });
+        }
+        break;
+      }
+
+      case 'openDiff': {
+        const { hash, filePath } = msg;
+        const left = vscode.Uri.parse(`cherry-picker-git:/${filePath}?${hash}~1`);
+        const right = vscode.Uri.parse(`cherry-picker-git:/${filePath}?${hash}`);
+        const title = `${filePath} (${hash.substring(0, 7)})`;
+        vscode.commands.executeCommand('vscode.diff', left, right, title);
+        break;
+      }
+
       case 'push': {
         const { branch } = msg;
         try {
@@ -323,6 +342,41 @@ export class CherryPickPanel {
     color: var(--vscode-list-activeSelectionForeground);
   }
   .ss-no-match { padding: 8px; font-size: 0.82em; opacity: 0.5; text-align: center; }
+  /* File changes per commit */
+  .file-changes {
+    display: none;
+    padding: 4px 12px 8px 38px;
+    border-bottom: 1px solid var(--vscode-panel-border);
+    background: var(--vscode-editor-background);
+  }
+  .file-changes.open { display: block; }
+  .file-item {
+    padding: 3px 6px;
+    font-size: 0.82em;
+    cursor: pointer;
+    border-radius: 3px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .file-item:hover { background: var(--vscode-list-hoverBackground); }
+  .file-status { font-weight: 600; font-size: 0.8em; width: 14px; text-align: center; }
+  .file-status.A { color: #2ea043; }
+  .file-status.M { color: #d29922; }
+  .file-status.D { color: #da3633; }
+  .file-status.R { color: #1f6feb; }
+  .btn-view-changes {
+    padding: 2px 8px;
+    font-size: 0.76em;
+    border-radius: 3px;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .btn-view-changes:hover { opacity: 0.85; }
 </style>
 </head>
 <body>
