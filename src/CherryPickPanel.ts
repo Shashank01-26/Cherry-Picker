@@ -567,8 +567,10 @@ function renderCommits(commits) {
           <span>\${escHtml(c.relativeDate)}</span>
         </div>
       </div>
+      <button class="btn-view-changes" onclick="viewChanges('\${c.hash}', event)">View Changes</button>
       <span class="commit-hash">\${c.shortHash}</span>
     </div>
+    <div class="file-changes" id="files-\${c.hash}"></div>
   \`).join('');
 
   updateCount();
@@ -685,12 +687,48 @@ window.addEventListener('message', e => {
       }
       break;
     }
+    case 'commitFilesLoaded':
+      renderFileChanges(msg.hash, msg.files);
+      break;
     case 'pushDone':
       showStatus('✅ Branch "' + msg.branch + '" pushed to origin successfully.', 'success');
       setBusy(false);
       break;
   }
 });
+
+// ── View file changes ──
+
+function viewChanges(hash, event) {
+  event.stopPropagation();
+  const container = document.getElementById('files-' + hash);
+  if (container.classList.contains('open')) {
+    container.classList.remove('open');
+    return;
+  }
+  container.innerHTML = '<div style="padding:6px;opacity:0.5;font-size:0.82em;">Loading...</div>';
+  container.classList.add('open');
+  vscode.postMessage({ command: 'getCommitFiles', hash: hash });
+}
+
+function renderFileChanges(hash, files) {
+  const container = document.getElementById('files-' + hash);
+  if (!files.length) {
+    container.innerHTML = '<div style="padding:6px;opacity:0.5;font-size:0.82em;">No file changes found.</div>';
+    return;
+  }
+  container.innerHTML = files.map(function(f) {
+    var q = "&apos;";
+    return '<div class="file-item" onclick="openDiff(' + q + escHtml(hash) + q + ', ' + q + escHtml(f.path) + q + ', ' + q + escHtml(f.status) + q + ')">'
+      + '<span class="file-status ' + escHtml(f.status) + '">' + escHtml(f.status) + '</span>'
+      + '<span>' + escHtml(f.path) + '</span>'
+      + '</div>';
+  }).join('');
+}
+
+function openDiff(hash, filePath, status) {
+  vscode.postMessage({ command: 'openDiff', hash: hash, filePath: filePath, status: status });
+}
 
 // Init searchable dropdowns on load
 initSearchSelects();
