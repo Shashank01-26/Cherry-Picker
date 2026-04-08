@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/shashank/.vscode/extensions/eamodio.gitlens-17.11.1/**)"
+    ]
+  }
+}

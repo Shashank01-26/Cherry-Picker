@@ -1,0 +1,78 @@
+{
+  "name": "cherry-picker",
+  "displayName": "Cherry Picker",
+  "description": "Visually cherry-pick commits across branches (qa/uat/stg/prod) and push feature branches",
+  "version": "0.0.1",
+  "publisher": "Shashank01-26",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "icon": "media/icon.png",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cherry-picker.open",
+        "title": "Open Cherry Picker",
+        "category": "Cherry Picker",
+        "icon": "$(git-merge)"
+      },
+      {
+        "command": "cherry-picker.refresh",
+        "title": "Refresh Branches",
+        "category": "Cherry Picker",
+        "icon": "$(refresh)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cherry-picker-sidebar",
+          "title": "Cherry Picker",
+          "icon": "media/cherry.svg"
+        }
+      ]
+    },
+    "views": {
+      "cherry-picker-sidebar": [
+        {
+          "id": "cherry-picker.branchView",
+          "name": "Branches",
+          "icon": "media/cherry.svg"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "cherry-picker.open",
+          "when": "view == cherry-picker.branchView",
+          "group": "navigation"
+        },
+        {
+          "command": "cherry-picker.refresh",
+          "when": "view == cherry-picker.branchView",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "npx tsc -p ./",
+    "watch": "npx tsc -watch -p ./",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
