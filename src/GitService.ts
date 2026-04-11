@@ -227,12 +227,35 @@ export class GitService {
   }
 
   /**
+   * Check if any file in the working tree still contains conflict markers.
+   */
+  hasConflictMarkers(): string[] {
+    try {
+      const out = this.run('git diff --name-only --diff-filter=U');
+      if (!out) { return []; }
+      return out.split('\n').filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Continue cherry-pick after user resolves conflicts.
-   * Stages all files, continues the cherry-pick, then processes remaining commits.
+   * Checks that all conflicts are actually resolved before proceeding.
    */
   continueCherryPick(state: CherryPickConflict): CherryPickResult | CherryPickConflict {
+    // First check if conflicts are still present — don't auto-resolve anything
+    const remaining = this.hasConflictMarkers();
+    if (remaining.length > 0) {
+      return { ...state, conflictedFiles: remaining };
+    }
+
     try {
-      this.run('git add -A');
+      // Only stage the files that were conflicted (user has resolved them)
+      for (const f of state.conflictedFiles) {
+        this.run(`git add -- "${f}"`);
+      }
+
       execSync('git cherry-pick --continue', {
         cwd: this.repoPath,
         encoding: 'utf8',
@@ -249,7 +272,6 @@ export class GitService {
         state.pickedSoFar + 1
       );
     } catch (err: any) {
-      // cherry-pick --continue failed, probably unresolved conflicts remain
       const conflictedFiles = this.getConflictedFiles();
       if (conflictedFiles.length > 0) {
         return { ...state, conflictedFiles };

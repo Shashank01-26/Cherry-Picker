@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { GitService, CommitInfo, CherryPickConflict } from './GitService';
+import { GitService, CherryPickConflict } from './GitService';
 
 export class CherryPickPanel {
   public static currentPanel: CherryPickPanel | undefined;
@@ -103,10 +103,23 @@ export class CherryPickPanel {
           this._panel.webview.postMessage({ command: 'error', message: 'No active conflict to continue.' });
           return;
         }
-        this._panel.webview.postMessage({ command: 'progress', message: 'Continuing cherry-pick...' });
         try {
           const result = this._git.continueCherryPick(this._conflictState);
-          this._handleCherryPickResult(result);
+          if (result.status === 'conflict') {
+            // Still has unresolved conflicts — update state and show error
+            this._conflictState = result;
+            this._panel.webview.postMessage({
+              command: 'conflictDetected',
+              conflictedFiles: result.conflictedFiles,
+              commitHash: result.currentCommitHash,
+              pickedSoFar: result.pickedSoFar,
+              totalCommits: result.allCommits.length,
+              targetBranch: result.targetBranch,
+            });
+            this._panel.webview.postMessage({ command: 'error', message: `${result.conflictedFiles.length} file(s) still have unresolved conflicts. Open them, resolve the markers, and save before continuing.` });
+          } else {
+            this._handleCherryPickResult(result);
+          }
         } catch (err: any) {
           this._panel.webview.postMessage({ command: 'error', message: err.message });
         }
@@ -500,28 +513,16 @@ export class CherryPickPanel {
   </div>
 </div>
 
-<!-- Step 3: Create feature branch -->
+<!-- Step 3: Cherry-pick onto target -->
 <div class="card" id="action-section" style="display:none">
-  <h2>Step 3 — Create Feature Branch &amp; Cherry-Pick</h2>
-  <div class="row">
-    <div class="field">
-      <label for="newBranchName">New Feature Branch Name</label>
-      <input type="text" id="newBranchName" placeholder="e.g. feature/cherry-pick-to-prod" />
-    </div>
-    <div class="field" style="max-width:220px">
-      <label>Base Branch <small>(branch off from)</small></label>
-      <div class="search-select" data-id="baseBranch" data-default="${defaultTarget}">
-        <input class="ss-input" type="text" placeholder="Search branches..." value="${defaultTarget}" />
-        <div class="ss-dropdown"></div>
-      </div>
-    </div>
-  </div>
+  <h2>Step 3 — Cherry-Pick onto Target Branch</h2>
+  <p style="font-size:0.85em;opacity:0.7;">Selected commits will be cherry-picked directly onto <strong id="targetBranchLabel"></strong>.</p>
   <div class="row">
     <button class="btn-success" id="btnCherryPick" onclick="doCherryPick(false)">
-      🍒 Cherry-Pick &amp; Create Branch
+      🍒 Cherry-Pick
     </button>
     <button class="btn-primary" id="btnCherryPickPush" onclick="doCherryPick(true)">
-      🍒 Cherry-Pick, Create &amp; Push
+      🍒 Cherry-Pick &amp; Push
     </button>
   </div>
 </div>
@@ -665,12 +666,7 @@ function renderCommits(commits) {
 
   updateCount();
   document.getElementById('action-section').style.display = 'flex';
-
-  // Default: set base branch to same as target
-  const target = getSSValue('targetBranch');
-  const baseWrapper = document.querySelector('.search-select[data-id="baseBranch"]');
-  if (baseWrapper) selectOption(baseWrapper, target);
-  document.getElementById('newBranchName').value = 'cherry-pick/' + target + '-' + Date.now().toString(36);
+  document.getElementById('targetBranchLabel').textContent = getSSValue('targetBranch');
 
   hideStatus();
 }
@@ -714,11 +710,9 @@ function updateCount() {
 }
 
 function doCherryPick(push) {
-  const newBranch = document.getElementById('newBranchName').value.trim();
-  const baseBranch = getSSValue('baseBranch');
+  const targetBranch = getSSValue('targetBranch');
 
-  if (!newBranch) { showStatus('Please enter a feature branch name.', 'error'); return; }
-  if (!baseBranch) { showStatus('Please select a base branch.', 'error'); return; }
+  if (!targetBranch) { showStatus('Please select a target branch.', 'error'); return; }
   if (selectedHashes.size === 0) { showStatus('Please select at least one commit.', 'error'); return; }
 
   const commits = allCommits
@@ -727,7 +721,7 @@ function doCherryPick(push) {
     .reverse();
 
   setBusy(true);
-  vscode.postMessage({ command: 'cherryPick', newBranch, baseBranch, commits, push });
+  vscode.postMessage({ command: 'cherryPick', targetBranch, commits, push });
 }
 
 function setBusy(busy) {
@@ -768,7 +762,7 @@ window.addEventListener('message', e => {
       const r = msg.result;
       if (r.status === 'success') {
         showStatus(
-          '✅ Branch "' + r.branch + '" created with ' + r.pickedCount + ' cherry-picked commit(s).',
+          '✅ ' + r.pickedCount + ' commit(s) cherry-picked onto "' + r.targetBranch + '" successfully.',
           'success'
         );
       } else {
@@ -801,10 +795,10 @@ window.addEventListener('message', e => {
 function showConflictUI(data) {
   document.getElementById('conflict-section').style.display = 'flex';
   document.getElementById('action-section').style.display = 'none';
-  document.getElementById('conflict-msg').textContent =
-    'Conflict on commit ' + data.commitHash.substring(0, 7) +
-    ' (' + data.pickedSoFar + ' of ' + data.totalCommits + ' picked so far). ' +
-    'Open the files below to resolve conflicts, then click Continue.';
+  document.getElementById('conflict-msg').innerHTML =
+    'Cherry-picking commit <strong>' + escHtml(data.commitHash.substring(0, 7)) + '</strong> onto <strong>' + escHtml(data.targetBranch) + '</strong> ' +
+    '(' + data.pickedSoFar + ' of ' + data.totalCommits + ' picked so far).<br>' +
+    'Click the files below to open them in the editor, resolve the conflict markers, <strong>save the file</strong>, then click <strong>Continue</strong>.';
   renderConflictFiles(data.conflictedFiles);
   hideStatus();
 }
@@ -816,16 +810,17 @@ function renderConflictFiles(files) {
     return;
   }
   list.innerHTML = files.map(function(f) {
-    var q = "&apos;";
-    return '<div class="conflict-file-item" onclick="openConflictFile(' + q + escHtml(f) + q + ')">'
+    return '<div class="conflict-file-item" data-filepath="' + escHtml(f) + '">'
       + '<span class="conflict-icon">!</span>'
       + '<span>' + escHtml(f) + '</span>'
       + '</div>';
   }).join('');
-}
-
-function openConflictFile(filePath) {
-  vscode.postMessage({ command: 'openConflictFile', filePath: filePath });
+  // Attach click handlers via event delegation
+  list.querySelectorAll('.conflict-file-item').forEach(function(item) {
+    item.addEventListener('click', function() {
+      vscode.postMessage({ command: 'openConflictFile', filePath: item.dataset.filepath });
+    });
+  });
 }
 
 function refreshConflicts() {
@@ -867,16 +862,16 @@ function renderFileChanges(hash, files) {
     return;
   }
   container.innerHTML = files.map(function(f) {
-    var q = "&apos;";
-    return '<div class="file-item" onclick="openDiff(' + q + escHtml(hash) + q + ', ' + q + escHtml(f.path) + q + ', ' + q + escHtml(f.status) + q + ')">'
+    return '<div class="file-item" data-hash="' + escHtml(hash) + '" data-filepath="' + escHtml(f.path) + '" data-status="' + escHtml(f.status) + '">'
       + '<span class="file-status ' + escHtml(f.status) + '">' + escHtml(f.status) + '</span>'
       + '<span>' + escHtml(f.path) + '</span>'
       + '</div>';
   }).join('');
-}
-
-function openDiff(hash, filePath, status) {
-  vscode.postMessage({ command: 'openDiff', hash: hash, filePath: filePath, status: status });
+  container.querySelectorAll('.file-item').forEach(function(item) {
+    item.addEventListener('click', function() {
+      vscode.postMessage({ command: 'openDiff', hash: item.dataset.hash, filePath: item.dataset.filepath, status: item.dataset.status });
+    });
+  });
 }
 
 // Init searchable dropdowns on load
