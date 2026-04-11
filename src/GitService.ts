@@ -34,6 +34,7 @@ export interface CherryPickConflict {
   originalBranch: string;
   push: boolean;
   pickedSoFar: number;
+  commitMessage?: string;
 }
 
 export class GitService {
@@ -167,7 +168,8 @@ export class GitService {
   async cherryPickCommits(
     targetBranch: string,
     commits: string[],
-    push: boolean
+    push: boolean,
+    commitMessage?: string
   ): Promise<CherryPickResult | CherryPickConflict> {
     const originalBranch = this.getCurrentBranch();
 
@@ -178,7 +180,7 @@ export class GitService {
       // Pull latest to avoid conflicts with remote
       try { this.run(`git pull origin "${targetBranch}" --quiet`); } catch {}
 
-      return this._pickCommitsFrom(0, commits, targetBranch, originalBranch, push, 0);
+      return this._pickCommitsFrom(0, commits, targetBranch, originalBranch, push, 0, commitMessage);
     } catch (err: any) {
       try { this.run(`git cherry-pick --abort`); } catch {}
       try { this.run(`git checkout "${originalBranch}"`); } catch {}
@@ -195,11 +197,18 @@ export class GitService {
     targetBranch: string,
     originalBranch: string,
     push: boolean,
-    pickedSoFar: number
+    pickedSoFar: number,
+    commitMessage?: string
   ): CherryPickResult | CherryPickConflict {
     for (let i = startIndex; i < allCommits.length; i++) {
       try {
-        this.run(`git cherry-pick ${allCommits[i]}`);
+        if (commitMessage) {
+          this.run(`git cherry-pick --no-commit ${allCommits[i]}`);
+          const escapedMsg = commitMessage.replace(/"/g, '\\"');
+          this.run(`git commit -m "${escapedMsg}"`);
+        } else {
+          this.run(`git cherry-pick ${allCommits[i]}`);
+        }
         pickedSoFar++;
       } catch {
         // Conflict — don't abort, let user resolve
@@ -214,6 +223,7 @@ export class GitService {
           originalBranch,
           push,
           pickedSoFar,
+          commitMessage,
         };
       }
     }
@@ -256,12 +266,19 @@ export class GitService {
         this.run(`git add -- "${f}"`);
       }
 
-      execSync('git cherry-pick --continue', {
-        cwd: this.repoPath,
-        encoding: 'utf8',
-        maxBuffer: 10 * 1024 * 1024,
-        env: { ...process.env, GIT_EDITOR: 'true' },
-      });
+      if (state.commitMessage) {
+        // Abort the in-progress cherry-pick and commit manually with custom message
+        const escapedMsg = state.commitMessage.replace(/"/g, '\\"');
+        this.run('git cherry-pick --abort');
+        this.run(`git commit -m "${escapedMsg}"`);
+      } else {
+        execSync('git cherry-pick --continue', {
+          cwd: this.repoPath,
+          encoding: 'utf8',
+          maxBuffer: 10 * 1024 * 1024,
+          env: { ...process.env, GIT_EDITOR: 'true' },
+        });
+      }
 
       return this._pickCommitsFrom(
         state.currentCommitIndex + 1,
@@ -269,7 +286,8 @@ export class GitService {
         state.targetBranch,
         state.originalBranch,
         state.push,
-        state.pickedSoFar + 1
+        state.pickedSoFar + 1,
+        state.commitMessage
       );
     } catch (err: any) {
       const conflictedFiles = this.getConflictedFiles();

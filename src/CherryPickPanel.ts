@@ -73,7 +73,7 @@ export class CherryPickPanel {
       }
 
       case 'cherryPick': {
-        const { targetBranch, commits, push } = msg;
+        const { targetBranch, commits, push, commitMessage } = msg;
 
         if (!commits || commits.length === 0) {
           this._panel.webview.postMessage({ command: 'error', message: 'Select at least one commit.' });
@@ -86,7 +86,7 @@ export class CherryPickPanel {
 
         this._panel.webview.postMessage({ command: 'progress', message: `Cherry-picking ${commits.length} commit(s) onto "${targetBranch}"...` });
 
-        const result = await this._git.cherryPickCommits(targetBranch, commits, push);
+        const result = await this._git.cherryPickCommits(targetBranch, commits, push, commitMessage || undefined);
         this._handleCherryPickResult(result);
         break;
       }
@@ -517,6 +517,10 @@ export class CherryPickPanel {
 <div class="card" id="action-section" style="display:none">
   <h2>Step 3 — Cherry-Pick onto Target Branch</h2>
   <p style="font-size:0.85em;opacity:0.7;">Selected commits will be cherry-picked directly onto <strong id="targetBranchLabel"></strong>.</p>
+  <div class="field">
+    <label>Commit Message <small>(optional — overrides original commit messages)</small></label>
+    <input type="text" id="commitMessage" placeholder="Leave empty to keep original commit messages" />
+  </div>
   <div class="row">
     <button class="btn-success" id="btnCherryPick" onclick="doCherryPick(false)">
       🍒 Cherry-Pick
@@ -720,8 +724,10 @@ function doCherryPick(push) {
     .map(c => c.hash)
     .reverse();
 
+  const commitMessage = document.getElementById('commitMessage').value.trim();
+
   setBusy(true);
-  vscode.postMessage({ command: 'cherryPick', targetBranch, commits, push });
+  vscode.postMessage({ command: 'cherryPick', targetBranch, commits, push, commitMessage });
 }
 
 function setBusy(busy) {
