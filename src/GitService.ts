@@ -35,36 +35,58 @@ export interface CherryPickConflict {
   push: boolean;
   pickedSoFar: number;
   commitMessage?: string;
+  /** SHA the target branch was at before this cherry-pick session started, so Abort can fully revert it. */
+  targetStartSha: string;
+  /** True when conflict markers are resolved but the result is a no-op (fix already exists on target) — needs Skip or Commit Empty instead of a normal Continue. */
+  emptyCommit?: boolean;
 }
+
+export type GitLogger = (message: string) => void;
 
 export class GitService {
   public readonly repoPath: string;
+  private readonly logger: GitLogger;
 
-  constructor(repoPath: string) {
+  constructor(repoPath: string, logger?: GitLogger) {
     this.repoPath = repoPath;
+    this.logger = logger || (() => {});
   }
 
   private run(cmd: string): string {
+    this.logger(`$ ${cmd}`);
     try {
-      return execSync(cmd, {
+      const out = execSync(cmd, {
         cwd: this.repoPath,
         encoding: 'utf8',
         maxBuffer: 10 * 1024 * 1024,
       }).trim();
+      if (out) { this.logger(out); }
+      return out;
     } catch (err: any) {
-      throw new Error(err.stderr?.trim() || err.message);
+      const message = err.stderr?.trim() || err.message;
+      this.logger(`  ✗ ${message}`);
+      throw new Error(message);
     }
   }
 
   private async runAsync(cmd: string): Promise<string> {
-    const { stdout, stderr } = await execAsync(cmd, {
-      cwd: this.repoPath,
-      maxBuffer: 10 * 1024 * 1024,
-    });
-    if (stderr && !stdout) {
-      throw new Error(stderr.trim());
+    this.logger(`$ ${cmd}`);
+    try {
+      const { stdout, stderr } = await execAsync(cmd, {
+        cwd: this.repoPath,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      if (stderr && !stdout) {
+        this.logger(`  ✗ ${stderr.trim()}`);
+        throw new Error(stderr.trim());
+      }
+      if (stdout) { this.logger(stdout.trim()); }
+      return stdout.trim();
+    } catch (err: any) {
+      const message = err.stderr?.trim() || err.message;
+      this.logger(`  ✗ ${message}`);
+      throw new Error(message);
     }
-    return stdout.trim();
   }
 
   isGitRepo(): boolean {
@@ -107,13 +129,34 @@ export class GitService {
   }
 
   /**
+   * Fast-forwards a local branch to match its remote counterpart before comparing.
+   * If the branch is currently checked out, does a real `pull` so the working tree
+   * stays in sync too. If it's a non-checked-out local branch, updates the branch
+   * ref directly via a fetch refspec (fails harmlessly if not a fast-forward —
+   * we never force-overwrite local commits). Falls back to a plain fetch so
+   * remote-only branches still resolve correctly.
+   */
+  private syncBranchToRemote(branch: string, currentBranch: string): void {
+    try {
+      if (branch === currentBranch) {
+        this.run(`git pull origin "${branch}" --ff-only --quiet`);
+      } else {
+        this.run(`git fetch origin "${branch}:${branch}" --quiet`);
+      }
+    } catch {
+      try { this.run(`git fetch origin "${branch}" --quiet`); } catch {}
+    }
+  }
+
+  /**
    * Returns commits that exist in sourceBranch but NOT in targetBranch.
    * These are the candidates for cherry-picking into target.
    */
   getCommitsBetween(sourceBranch: string, targetBranch: string): CommitInfo[] {
-    // Make sure we have latest info
-    try { this.run(`git fetch origin "${sourceBranch}" --quiet`); } catch {}
-    try { this.run(`git fetch origin "${targetBranch}" --quiet`); } catch {}
+    // Make sure we have latest info from origin before comparing
+    const currentBranch = this.getCurrentBranch();
+    this.syncBranchToRemote(sourceBranch, currentBranch);
+    this.syncBranchToRemote(targetBranch, currentBranch);
 
     const sourceSha = this.resolveToSha(sourceBranch);
     const targetSha = this.resolveToSha(targetBranch);
@@ -179,8 +222,10 @@ export class GitService {
       this.run(`git checkout "${targetBranch}"`);
       // Pull latest to avoid conflicts with remote
       try { this.run(`git pull origin "${targetBranch}" --quiet`); } catch {}
+      // Record where target started so Abort can fully revert this session's commits
+      const targetStartSha = this.run('git rev-parse HEAD');
 
-      return this._pickCommitsFrom(0, commits, targetBranch, originalBranch, push, 0, commitMessage);
+      return this._pickCommitsFrom(0, commits, targetBranch, originalBranch, push, 0, targetStartSha, commitMessage);
     } catch (err: any) {
       try { this.run(`git cherry-pick --abort`); } catch {}
       try { this.run(`git checkout "${originalBranch}"`); } catch {}
@@ -198,6 +243,7 @@ export class GitService {
     originalBranch: string,
     push: boolean,
     pickedSoFar: number,
+    targetStartSha: string,
     commitMessage?: string
   ): CherryPickResult | CherryPickConflict {
     for (let i = startIndex; i < allCommits.length; i++) {
@@ -224,6 +270,7 @@ export class GitService {
           push,
           pickedSoFar,
           commitMessage,
+          targetStartSha,
         };
       }
     }
@@ -267,9 +314,9 @@ export class GitService {
       }
 
       if (state.commitMessage) {
-        // Abort the in-progress cherry-pick and commit manually with custom message
+        // CHERRY_PICK_HEAD is still set from the --no-commit pick, so a plain
+        // commit here completes it (same mechanism git itself uses) — no abort needed.
         const escapedMsg = state.commitMessage.replace(/"/g, '\\"');
-        this.run('git cherry-pick --abort');
         this.run(`git commit -m "${escapedMsg}"`);
       } else {
         execSync('git cherry-pick --continue', {
@@ -287,24 +334,79 @@ export class GitService {
         state.originalBranch,
         state.push,
         state.pickedSoFar + 1,
+        state.targetStartSha,
         state.commitMessage
       );
     } catch (err: any) {
+      const message = err.stderr?.trim() || err.message;
+      // Conflict resolution nets out to no actual change vs. target — git refuses
+      // to auto-create an empty commit. Let the user explicitly choose instead of
+      // getting stuck retrying the same failing continue.
+      if (/previous cherry-pick is now empty/i.test(message) || /nothing to commit/i.test(message)) {
+        return { ...state, conflictedFiles: [], emptyCommit: true };
+      }
       const conflictedFiles = this.getConflictedFiles();
       if (conflictedFiles.length > 0) {
         return { ...state, conflictedFiles };
       }
-      throw new Error(err.stderr?.trim() || err.message);
+      throw new Error(message);
     }
   }
 
   /**
+   * Skip the current commit entirely — its change already exists on the target
+   * branch (that's why resolving conflicts produced an empty diff), so there's
+   * nothing to commit. Does not count towards pickedSoFar.
+   */
+  skipCurrentCommit(state: CherryPickConflict): CherryPickResult | CherryPickConflict {
+    this.run('git cherry-pick --skip');
+    return this._pickCommitsFrom(
+      state.currentCommitIndex + 1,
+      state.allCommits,
+      state.targetBranch,
+      state.originalBranch,
+      state.push,
+      state.pickedSoFar,
+      state.targetStartSha,
+      state.commitMessage
+    );
+  }
+
+  /**
+   * Force-commit the current pick as an empty commit, preserving a record of it
+   * in history even though it introduced no changes.
+   */
+  commitCurrentAsEmpty(state: CherryPickConflict): CherryPickResult | CherryPickConflict {
+    if (state.commitMessage) {
+      const escapedMsg = state.commitMessage.replace(/"/g, '\\"');
+      this.run(`git commit --allow-empty -m "${escapedMsg}"`);
+    } else {
+      this.run(`git commit --allow-empty -C ${state.currentCommitHash}`);
+    }
+    return this._pickCommitsFrom(
+      state.currentCommitIndex + 1,
+      state.allCommits,
+      state.targetBranch,
+      state.originalBranch,
+      state.push,
+      state.pickedSoFar + 1,
+      state.targetStartSha,
+      state.commitMessage
+    );
+  }
+
+  /**
    * Abort cherry-pick, reset the target branch, and go back to original branch.
+   * `--abort` alone only undoes the in-progress (conflicted) pick — any earlier
+   * commits from this same batch that already succeeded would otherwise stay
+   * committed, so we hard-reset the target branch back to where it was before
+   * this cherry-pick session started.
    */
   abortCherryPick(state: CherryPickConflict): CherryPickResult {
     try { this.run('git cherry-pick --abort'); } catch {}
+    try { this.run(`git reset --hard ${state.targetStartSha}`); } catch {}
     try { this.run(`git checkout "${state.originalBranch}"`); } catch {}
-    return { status: 'error', targetBranch: state.targetBranch, pickedCount: 0, error: 'Cherry-pick aborted by user.' };
+    return { status: 'error', targetBranch: state.targetBranch, pickedCount: 0, error: 'Cherry-pick aborted by user. Target branch reverted to its original state.' };
   }
 
   getConflictedFiles(): string[] {

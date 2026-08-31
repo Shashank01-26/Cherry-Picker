@@ -106,7 +106,6 @@ export class CherryPickPanel {
         try {
           const result = this._git.continueCherryPick(this._conflictState);
           if (result.status === 'conflict') {
-            // Still has unresolved conflicts — update state and show error
             this._conflictState = result;
             this._panel.webview.postMessage({
               command: 'conflictDetected',
@@ -115,11 +114,44 @@ export class CherryPickPanel {
               pickedSoFar: result.pickedSoFar,
               totalCommits: result.allCommits.length,
               targetBranch: result.targetBranch,
+              emptyCommit: result.emptyCommit,
             });
-            this._panel.webview.postMessage({ command: 'error', message: `${result.conflictedFiles.length} file(s) still have unresolved conflicts. Open them, resolve the markers, and save before continuing.` });
+            if (result.emptyCommit) {
+              this._panel.webview.postMessage({ command: 'progress', message: 'This commit introduces no changes on the target branch — choose Skip or Commit as Empty below.' });
+            } else {
+              this._panel.webview.postMessage({ command: 'error', message: `${result.conflictedFiles.length} file(s) still have unresolved conflicts. Open them, resolve the markers, and save before continuing.` });
+            }
           } else {
             this._handleCherryPickResult(result);
           }
+        } catch (err: any) {
+          this._panel.webview.postMessage({ command: 'error', message: err.message });
+        }
+        break;
+      }
+
+      case 'skipCommit': {
+        if (!this._conflictState) {
+          this._panel.webview.postMessage({ command: 'error', message: 'No active conflict to skip.' });
+          return;
+        }
+        try {
+          const result = this._git.skipCurrentCommit(this._conflictState);
+          this._handleCherryPickResult(result);
+        } catch (err: any) {
+          this._panel.webview.postMessage({ command: 'error', message: err.message });
+        }
+        break;
+      }
+
+      case 'commitEmpty': {
+        if (!this._conflictState) {
+          this._panel.webview.postMessage({ command: 'error', message: 'No active conflict to commit.' });
+          return;
+        }
+        try {
+          const result = this._git.commitCurrentAsEmpty(this._conflictState);
+          this._handleCherryPickResult(result);
         } catch (err: any) {
           this._panel.webview.postMessage({ command: 'error', message: err.message });
         }
@@ -193,6 +225,7 @@ export class CherryPickPanel {
         pickedSoFar: result.pickedSoFar,
         totalCommits: result.allCommits.length,
         targetBranch: result.targetBranch,
+        emptyCommit: result.emptyCommit,
       });
     } else {
       this._conflictState = undefined;
@@ -343,12 +376,27 @@ export class CherryPickPanel {
   /* Status / log */
   #status-bar {
     display: none;
+    align-items: flex-start;
+    gap: 10px;
     padding: 10px 14px;
     border-radius: var(--radius);
     font-size: 0.88em;
     line-height: 1.5;
     border: 1px solid transparent;
   }
+  #status-bar-text { flex: 1; }
+  #status-bar-close {
+    background: transparent;
+    border: none;
+    padding: 0 2px;
+    margin: 0;
+    font-size: 1.1em;
+    line-height: 1.4;
+    opacity: 0.6;
+    cursor: pointer;
+    color: inherit;
+  }
+  #status-bar-close:hover { opacity: 1; }
   #status-bar.info  { background: var(--vscode-inputValidation-infoBackground, #1a3a5c); border-color: var(--vscode-inputValidation-infoBorder, #007acc); color: var(--vscode-inputValidation-infoForeground, var(--vscode-foreground)); }
   #status-bar.error { background: var(--vscode-inputValidation-errorBackground, #5c1a1a); border-color: var(--vscode-inputValidation-errorBorder, #da3633); }
   #status-bar.success { background: rgba(46,160,67,0.15); border-color: #2ea043; }
@@ -536,15 +584,23 @@ export class CherryPickPanel {
   <h2>Conflict Resolution</h2>
   <p class="conflict-msg" id="conflict-msg"></p>
   <div class="conflict-file-list" id="conflictFileList"></div>
-  <div class="row" style="margin-top:4px;">
+  <div class="row" id="conflict-normal-actions" style="margin-top:4px;">
     <button class="btn-secondary" onclick="refreshConflicts()">Refresh</button>
     <button class="btn-success" onclick="continueResolve()">Continue Cherry-Pick</button>
+    <button class="btn-danger" onclick="abortResolve()">Abort</button>
+  </div>
+  <div class="row" id="conflict-empty-actions" style="margin-top:4px; display:none;">
+    <button class="btn-secondary" onclick="skipCommit()">Skip This Commit</button>
+    <button class="btn-success" onclick="commitEmpty()">Commit as Empty</button>
     <button class="btn-danger" onclick="abortResolve()">Abort</button>
   </div>
 </div>
 
 <!-- Status -->
-<div id="status-bar"></div>
+<div id="status-bar">
+  <span id="status-bar-text"></span>
+  <button id="status-bar-close" onclick="hideStatus()" title="Dismiss">&times;</button>
+</div>
 
 <script>
 const vscode = acquireVsCodeApi();
@@ -738,9 +794,9 @@ function setBusy(busy) {
 
 function showStatus(msg, type) {
   const bar = document.getElementById('status-bar');
-  bar.textContent = msg;
+  document.getElementById('status-bar-text').textContent = msg;
   bar.className = type;
-  bar.style.display = 'block';
+  bar.style.display = 'flex';
 }
 function hideStatus() {
   document.getElementById('status-bar').style.display = 'none';
@@ -801,12 +857,40 @@ window.addEventListener('message', e => {
 function showConflictUI(data) {
   document.getElementById('conflict-section').style.display = 'flex';
   document.getElementById('action-section').style.display = 'none';
-  document.getElementById('conflict-msg').innerHTML =
-    'Cherry-picking commit <strong>' + escHtml(data.commitHash.substring(0, 7)) + '</strong> onto <strong>' + escHtml(data.targetBranch) + '</strong> ' +
-    '(' + data.pickedSoFar + ' of ' + data.totalCommits + ' picked so far).<br>' +
-    'Click the files below to open them in the editor, resolve the conflict markers, <strong>save the file</strong>, then click <strong>Continue</strong>.';
-  renderConflictFiles(data.conflictedFiles);
+
+  const fileList = document.getElementById('conflictFileList');
+  const normalActions = document.getElementById('conflict-normal-actions');
+  const emptyActions = document.getElementById('conflict-empty-actions');
+
+  if (data.emptyCommit) {
+    document.getElementById('conflict-msg').innerHTML =
+      'Commit <strong>' + escHtml(data.commitHash.substring(0, 7)) + '</strong> introduces no changes on <strong>' + escHtml(data.targetBranch) + '</strong> after conflict resolution — the fix likely already exists there ' +
+      '(' + data.pickedSoFar + ' of ' + data.totalCommits + ' picked so far).<br>' +
+      '<strong>Skip</strong> to drop this commit, or <strong>Commit as Empty</strong> to keep a record of it in history.';
+    fileList.style.display = 'none';
+    normalActions.style.display = 'none';
+    emptyActions.style.display = 'flex';
+  } else {
+    document.getElementById('conflict-msg').innerHTML =
+      'Cherry-picking commit <strong>' + escHtml(data.commitHash.substring(0, 7)) + '</strong> onto <strong>' + escHtml(data.targetBranch) + '</strong> ' +
+      '(' + data.pickedSoFar + ' of ' + data.totalCommits + ' picked so far).<br>' +
+      'Click the files below to open them in the editor, resolve the conflict markers, <strong>save the file</strong>, then click <strong>Continue</strong>.';
+    fileList.style.display = 'block';
+    normalActions.style.display = 'flex';
+    emptyActions.style.display = 'none';
+    renderConflictFiles(data.conflictedFiles);
+  }
   hideStatus();
+}
+
+function skipCommit() {
+  showStatus('Skipping empty commit...', 'progress');
+  vscode.postMessage({ command: 'skipCommit' });
+}
+
+function commitEmpty() {
+  showStatus('Committing as empty...', 'progress');
+  vscode.postMessage({ command: 'commitEmpty' });
 }
 
 function renderConflictFiles(files) {
@@ -845,6 +929,10 @@ function abortResolve() {
 
 function hideConflictUI() {
   document.getElementById('conflict-section').style.display = 'none';
+  // Restore the cherry-pick buttons so the user can retry without re-comparing
+  if (allCommits.length > 0) {
+    document.getElementById('action-section').style.display = 'flex';
+  }
 }
 
 // ── View file changes ──

@@ -11,8 +11,11 @@ export function activate(context: vscode.ExtensionContext) {
     return;
   }
 
+  const outputChannel = vscode.window.createOutputChannel('Cherry Picker');
+  context.subscriptions.push(outputChannel);
+
   const repoPath = workspaceFolders[0].uri.fsPath;
-  const git = new GitService(repoPath);
+  const git = new GitService(repoPath, (msg) => outputChannel.appendLine(msg));
 
   if (!git.isGitRepo()) {
     vscode.window.showErrorMessage('Cherry Picker: No git repository found in the current workspace.');
