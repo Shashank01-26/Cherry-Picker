@@ -3,7 +3,7 @@
   "displayName": "Cherry Picker",
   "description": "Visually cherry-pick commits across branches (qa/uat/stg/prod) and push feature branches",
   "version": "0.0.1",
-  "publisher": "Shashank01-26",
+  "publisher": "shashank-dev",
   "engines": {
     "vscode": "^1.85.0"
   },
