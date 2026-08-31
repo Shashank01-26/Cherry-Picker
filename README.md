@@ -1,6 +1,6 @@
 # Cherry Picker
 
-Visually cherry-pick commits across branches — no more memorizing SHAs or juggling `git cherry-pick` in the terminal.
+Visually cherry-pick commits across branches no more memorizing SHAs or juggling `git cherry-pick` in the terminal.
 
 Cherry Picker gives you a guided, 3-step panel for picking commits from one branch (say, your feature branch) onto another (`qa`, `uat`, `stg`, `prod`, or any branch you maintain), with built-in conflict resolution and one-click push.
 
