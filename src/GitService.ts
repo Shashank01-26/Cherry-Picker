@@ -1,7 +1,4 @@
-import { execSync, exec } from 'child_process';
-import { promisify } from 'util';
-
-const execAsync = promisify(exec);
+import { execSync } from 'child_process';
 
 export interface CommitInfo {
   hash: string;
@@ -56,7 +53,7 @@ export class GitService {
     this.logger(`$ ${cmd}`);
     try {
       const out = execSync(cmd, {
-        cwd: this.repoPath,
+        cwd: this.getRepoRoot(),
         encoding: 'utf8',
         maxBuffer: 10 * 1024 * 1024,
       }).trim();
@@ -69,24 +66,32 @@ export class GitService {
     }
   }
 
-  private async runAsync(cmd: string): Promise<string> {
-    this.logger(`$ ${cmd}`);
-    try {
-      const { stdout, stderr } = await execAsync(cmd, {
-        cwd: this.repoPath,
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      if (stderr && !stdout) {
-        this.logger(`  ✗ ${stderr.trim()}`);
-        throw new Error(stderr.trim());
+  private _repoRoot: string | undefined;
+
+  /**
+   * Absolute path to the git repository's top-level directory. This can differ
+   * from `repoPath` (the VSCode workspace folder) when the workspace is opened
+   * at a subdirectory of the repo. It matters for more than just opening files:
+   * git commands that resolve pathspecs (e.g. `git add <path>`) do so relative
+   * to the process's cwd, while `git diff`/`status` always REPORT paths
+   * relative to the repo root — so every git invocation here must run from
+   * the repo root, or a root-relative path like "packages/x" gets mangled
+   * into "packages/packages/x" when cwd is already "packages".
+   * Resolved directly via execSync (not through `run()`) to avoid recursion,
+   * since `run()` itself uses this as its cwd.
+   */
+  getRepoRoot(): string {
+    if (!this._repoRoot) {
+      try {
+        this._repoRoot = execSync('git rev-parse --show-toplevel', {
+          cwd: this.repoPath,
+          encoding: 'utf8',
+        }).trim();
+      } catch (err: any) {
+        throw new Error(err.stderr?.trim() || err.message);
       }
-      if (stdout) { this.logger(stdout.trim()); }
-      return stdout.trim();
-    } catch (err: any) {
-      const message = err.stderr?.trim() || err.message;
-      this.logger(`  ✗ ${message}`);
-      throw new Error(message);
     }
+    return this._repoRoot;
   }
 
   isGitRepo(): boolean {
@@ -320,7 +325,7 @@ export class GitService {
         this.run(`git commit -m "${escapedMsg}"`);
       } else {
         execSync('git cherry-pick --continue', {
-          cwd: this.repoPath,
+          cwd: this.getRepoRoot(),
           encoding: 'utf8',
           maxBuffer: 10 * 1024 * 1024,
           env: { ...process.env, GIT_EDITOR: 'true' },
@@ -417,10 +422,6 @@ export class GitService {
     } catch {
       return [];
     }
-  }
-
-  async pushBranch(branchName: string): Promise<void> {
-    await this.runAsync(`git push -u origin "${branchName}"`);
   }
 
   getCommitFiles(hash: string): CommitFileChange[] {

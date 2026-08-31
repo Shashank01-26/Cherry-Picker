@@ -92,41 +92,26 @@ export class CherryPickPanel {
       }
 
       case 'openConflictFile': {
-        const absPath = path.join(this._git.repoPath, msg.filePath);
+        const absPath = path.join(this._git.getRepoRoot(), msg.filePath);
         const uri = vscode.Uri.file(absPath);
-        vscode.window.showTextDocument(uri, { preview: false });
+        try {
+          // Cherry-pick conflicts are real git merge conflicts under the hood
+          // (same index stages) — open VS Code's native 3-way Merge Editor
+          // instead of a plain text editor showing raw conflict markers.
+          await vscode.commands.executeCommand('git.openMergeEditor', uri);
+        } catch {
+          vscode.window.showTextDocument(uri, { preview: false });
+        }
         break;
       }
 
       case 'continueResolve': {
-        if (!this._conflictState) {
-          this._panel.webview.postMessage({ command: 'error', message: 'No active conflict to continue.' });
-          return;
-        }
-        try {
-          const result = this._git.continueCherryPick(this._conflictState);
-          if (result.status === 'conflict') {
-            this._conflictState = result;
-            this._panel.webview.postMessage({
-              command: 'conflictDetected',
-              conflictedFiles: result.conflictedFiles,
-              commitHash: result.currentCommitHash,
-              pickedSoFar: result.pickedSoFar,
-              totalCommits: result.allCommits.length,
-              targetBranch: result.targetBranch,
-              emptyCommit: result.emptyCommit,
-            });
-            if (result.emptyCommit) {
-              this._panel.webview.postMessage({ command: 'progress', message: 'This commit introduces no changes on the target branch — choose Skip or Commit as Empty below.' });
-            } else {
-              this._panel.webview.postMessage({ command: 'error', message: `${result.conflictedFiles.length} file(s) still have unresolved conflicts. Open them, resolve the markers, and save before continuing.` });
-            }
-          } else {
-            this._handleCherryPickResult(result);
-          }
-        } catch (err: any) {
-          this._panel.webview.postMessage({ command: 'error', message: err.message });
-        }
+        this._continueResolve(false);
+        break;
+      }
+
+      case 'commitAndPushResolve': {
+        this._continueResolve(true);
         break;
       }
 
@@ -196,22 +181,47 @@ export class CherryPickPanel {
         break;
       }
 
-      case 'push': {
-        const { branch } = msg;
-        try {
-          this._panel.webview.postMessage({ command: 'progress', message: `Pushing "${branch}" to origin...` });
-          await this._git.pushBranch(branch);
-          this._panel.webview.postMessage({ command: 'pushDone', branch });
-        } catch (err: any) {
-          this._panel.webview.postMessage({ command: 'error', message: err.message });
-        }
-        break;
-      }
-
       case 'refresh': {
         this._refresh();
         break;
       }
+    }
+  }
+
+  /**
+   * Resolve the current conflict and continue the cherry-pick sequence.
+   * `forcePush` upgrades this session's push flag so that once the whole
+   * batch completes (immediately, or after further conflicts), it auto-pushes.
+   */
+  private _continueResolve(forcePush: boolean) {
+    if (!this._conflictState) {
+      this._panel.webview.postMessage({ command: 'error', message: 'No active conflict to continue.' });
+      return;
+    }
+    try {
+      const state = forcePush ? { ...this._conflictState, push: true } : this._conflictState;
+      const result = this._git.continueCherryPick(state);
+      if (result.status === 'conflict') {
+        this._conflictState = result;
+        this._panel.webview.postMessage({
+          command: 'conflictDetected',
+          conflictedFiles: result.conflictedFiles,
+          commitHash: result.currentCommitHash,
+          pickedSoFar: result.pickedSoFar,
+          totalCommits: result.allCommits.length,
+          targetBranch: result.targetBranch,
+          emptyCommit: result.emptyCommit,
+        });
+        if (result.emptyCommit) {
+          this._panel.webview.postMessage({ command: 'progress', message: 'This commit introduces no changes on the target branch — choose Skip or Commit as Empty below.' });
+        } else {
+          this._panel.webview.postMessage({ command: 'error', message: `${result.conflictedFiles.length} file(s) still have unresolved conflicts. Open them, resolve the markers, and save before continuing.` });
+        }
+      } else {
+        this._handleCherryPickResult(result);
+      }
+    } catch (err: any) {
+      this._panel.webview.postMessage({ command: 'error', message: err.message });
     }
   }
 
@@ -587,6 +597,7 @@ export class CherryPickPanel {
   <div class="row" id="conflict-normal-actions" style="margin-top:4px;">
     <button class="btn-secondary" onclick="refreshConflicts()">Refresh</button>
     <button class="btn-success" onclick="continueResolve()">Continue Cherry-Pick</button>
+    <button class="btn-primary" onclick="commitAndPushResolve()" title="Resolve this commit, continue the cherry-pick, and push once complete">Commit and Push</button>
     <button class="btn-danger" onclick="abortResolve()">Abort</button>
   </div>
   <div class="row" id="conflict-empty-actions" style="margin-top:4px; display:none;">
@@ -845,10 +856,6 @@ window.addEventListener('message', e => {
     case 'commitFilesLoaded':
       renderFileChanges(msg.hash, msg.files);
       break;
-    case 'pushDone':
-      showStatus('✅ Branch "' + msg.branch + '" pushed to origin successfully.', 'success');
-      setBusy(false);
-      break;
   }
 });
 
@@ -920,6 +927,11 @@ function refreshConflicts() {
 function continueResolve() {
   showStatus('Continuing cherry-pick...', 'progress');
   vscode.postMessage({ command: 'continueResolve' });
+}
+
+function commitAndPushResolve() {
+  showStatus('Continuing cherry-pick and preparing to push...', 'progress');
+  vscode.postMessage({ command: 'commitAndPushResolve' });
 }
 
 function abortResolve() {
