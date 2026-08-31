@@ -11,6 +11,12 @@ export function activate(context: vscode.ExtensionContext) {
     return;
   }
 
+  if (workspaceFolders.length > 1) {
+    vscode.window.showInformationMessage(
+      `Cherry Picker: Multiple workspace folders detected — operating on "${workspaceFolders[0].name}" only. Open that repo alone as your workspace to target a different one.`
+    );
+  }
+
   const outputChannel = vscode.window.createOutputChannel('Cherry Picker');
   context.subscriptions.push(outputChannel);
 
@@ -40,14 +46,16 @@ export function activate(context: vscode.ExtensionContext) {
   });
   context.subscriptions.push(treeView);
 
-  // Open panel command
-  const openCmd = vscode.commands.registerCommand('cherry-picker.open', () => {
-    CherryPickPanel.createOrShow(context.extensionUri, git);
+  // Open panel command — an optional branch name (from a sidebar click)
+  // pre-selects that branch as the target in Step 1.
+  const openCmd = vscode.commands.registerCommand('cherry-picker.open', (branchName?: string) => {
+    CherryPickPanel.createOrShow(context.extensionUri, git, branchName);
   });
 
   // Refresh command
   const refreshCmd = vscode.commands.registerCommand('cherry-picker.refresh', () => {
     treeProvider.refresh();
+    CherryPickPanel.currentPanel?.refreshBranches();
     vscode.window.showInformationMessage('Cherry Picker: Branches refreshed.');
   });
 

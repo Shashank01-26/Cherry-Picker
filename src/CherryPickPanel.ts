@@ -11,14 +11,20 @@ export class CherryPickPanel {
   private _disposables: vscode.Disposable[] = [];
   private _conflictState: CherryPickConflict | undefined;
 
-  public static createOrShow(extensionUri: vscode.Uri, git: GitService) {
+  public static createOrShow(extensionUri: vscode.Uri, git: GitService, presetTargetBranch?: string) {
     const column = vscode.window.activeTextEditor
       ? vscode.window.activeTextEditor.viewColumn
       : undefined;
 
     if (CherryPickPanel.currentPanel) {
       CherryPickPanel.currentPanel._panel.reveal(column);
-      CherryPickPanel.currentPanel._refresh();
+      // Don't blow away an in-progress conflict resolution with a full
+      // re-render — just reveal what's already on screen.
+      if (!CherryPickPanel.currentPanel._conflictState) {
+        CherryPickPanel.currentPanel._refresh(presetTargetBranch);
+      } else if (presetTargetBranch) {
+        CherryPickPanel.currentPanel._panel.webview.postMessage({ command: 'presetTarget', branch: presetTargetBranch });
+      }
       return;
     }
 
@@ -33,10 +39,10 @@ export class CherryPickPanel {
       }
     );
 
-    CherryPickPanel.currentPanel = new CherryPickPanel(panel, git);
+    CherryPickPanel.currentPanel = new CherryPickPanel(panel, git, presetTargetBranch);
   }
 
-  private constructor(panel: vscode.WebviewPanel, git: GitService) {
+  private constructor(panel: vscode.WebviewPanel, git: GitService, presetTargetBranch?: string) {
     this._panel = panel;
     this._git = git;
 
@@ -49,14 +55,48 @@ export class CherryPickPanel {
       this._disposables
     );
 
-    this._refresh();
+    // Keep the branch dropdowns fresh: re-fetch from origin whenever the
+    // panel regains focus, not just at initial creation.
+    this._panel.onDidChangeViewState(e => {
+      if (e.webviewPanel.visible) {
+        this._pushBranches(false);
+      }
+    }, null, this._disposables);
+
+    this._refresh(presetTargetBranch);
   }
 
-  private _refresh() {
+  private _refresh(presetTargetBranch?: string) {
     const branches = this._git.getAllBranches();
     const currentBranch = this._git.getCurrentBranch();
     const repoName = this._git.getRepoName();
-    this._panel.webview.html = this._getHtml(branches, currentBranch, repoName);
+    this._panel.webview.html = this._getHtml(branches, currentBranch, repoName, presetTargetBranch);
+  }
+
+  /** Called by the sidebar's "Refresh Branches" command. */
+  public refreshBranches() {
+    this._pushBranches(true);
+  }
+
+  /**
+   * Re-fetches origin and pushes an updated branch list into the webview
+   * without a full page reload, so the dropdowns stay current even if the
+   * panel has been open a while (e.g. a teammate pushed a new branch).
+   */
+  private _pushBranches(showWarningOnFailure: boolean) {
+    const fetchOk = this._git.refreshRemotes();
+    try {
+      const branches = this._git.getAllBranches();
+      const currentBranch = this._git.getCurrentBranch();
+      this._panel.webview.postMessage({ command: 'branchesLoaded', branches, currentBranch });
+      if (!fetchOk && showWarningOnFailure) {
+        this._panel.webview.postMessage({ command: 'error', message: 'Could not reach origin to refresh branches — showing the last known list.' });
+      }
+    } catch (err: any) {
+      if (showWarningOnFailure) {
+        this._panel.webview.postMessage({ command: 'error', message: err.message });
+      }
+    }
   }
 
   private async _handleMessage(msg: any) {
@@ -174,10 +214,18 @@ export class CherryPickPanel {
 
       case 'openDiff': {
         const { hash, filePath } = msg;
-        const left = vscode.Uri.parse(`cherry-picker-git:/${filePath}?${hash}~1`);
-        const right = vscode.Uri.parse(`cherry-picker-git:/${filePath}?${hash}`);
+        // Built via Uri.from (structured components) rather than Uri.parse on a
+        // raw interpolated string, so a filePath containing '#', '?', or '%'
+        // can't be misparsed into the wrong scheme/path/query/fragment.
+        const left = vscode.Uri.from({ scheme: 'cherry-picker-git', path: '/' + filePath, query: `${hash}~1` });
+        const right = vscode.Uri.from({ scheme: 'cherry-picker-git', path: '/' + filePath, query: hash });
         const title = `${filePath} (${hash.substring(0, 7)})`;
         vscode.commands.executeCommand('vscode.diff', left, right, title);
+        break;
+      }
+
+      case 'getBranches': {
+        this._pushBranches(true);
         break;
       }
 
@@ -215,7 +263,8 @@ export class CherryPickPanel {
         if (result.emptyCommit) {
           this._panel.webview.postMessage({ command: 'progress', message: 'This commit introduces no changes on the target branch — choose Skip or Commit as Empty below.' });
         } else {
-          this._panel.webview.postMessage({ command: 'error', message: `${result.conflictedFiles.length} file(s) still have unresolved conflicts. Open them, resolve the markers, and save before continuing.` });
+          const pushNote = forcePush ? ' Nothing was committed or pushed.' : '';
+          this._panel.webview.postMessage({ command: 'error', message: `${result.conflictedFiles.length} file(s) still have unresolved conflicts. Open them, resolve the markers, and save before continuing.${pushNote}` });
         }
       } else {
         this._handleCherryPickResult(result);
@@ -244,10 +293,13 @@ export class CherryPickPanel {
     }
   }
 
-  private _getHtml(branches: string[], currentBranch: string, repoName: string): string {
+  private _getHtml(branches: string[], currentBranch: string, repoName: string, presetTargetBranch?: string): string {
     // Suggest default target branches
     const envBranches = ['prod', 'stg', 'uat', 'qa', 'main', 'master', 'develop'];
-    const defaultTarget = envBranches.find(b => branches.includes(b) && b !== currentBranch) ?? branches[0] ?? '';
+    let defaultTarget = envBranches.find(b => branches.includes(b) && b !== currentBranch) ?? branches[0] ?? '';
+    if (presetTargetBranch && presetTargetBranch !== currentBranch && branches.includes(presetTargetBranch)) {
+      defaultTarget = presetTargetBranch;
+    }
 
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -554,6 +606,7 @@ export class CherryPickPanel {
         <div class="ss-dropdown"></div>
       </div>
     </div>
+    <button class="btn-secondary" id="btnRefreshBranches" onclick="refreshBranches()" title="Re-fetch the branch list from origin" style="font-size:1.3em; line-height:1; padding:7px 14px;">⟳</button>
     <button class="btn-primary" id="btnCompare" onclick="loadCommits()">Compare</button>
   </div>
 </div>
@@ -617,7 +670,7 @@ export class CherryPickPanel {
 const vscode = acquireVsCodeApi();
 let allCommits = [];
 let selectedHashes = new Set();
-const ALL_BRANCHES = ${JSON.stringify(branches)};
+let ALL_BRANCHES = ${JSON.stringify(branches)};
 
 // ── Searchable dropdown logic ──
 const ssValues = {}; // stores selected values by data-id
@@ -684,6 +737,12 @@ function closeAllDropdowns() {
 
 function getSSValue(id) {
   return ssValues[id] || '';
+}
+
+function setSSValue(id, value) {
+  ssValues[id] = value;
+  const wrapper = document.querySelector('.search-select[data-id="' + id + '"]');
+  if (wrapper) { wrapper.querySelector('.ss-input').value = value; }
 }
 
 // ── Core logic ──
@@ -838,6 +897,12 @@ window.addEventListener('message', e => {
           '✅ ' + r.pickedCount + ' commit(s) cherry-picked onto "' + r.targetBranch + '" successfully.',
           'success'
         );
+        // The target branch just changed — this commit list is now stale.
+        // Force a fresh Compare before allowing another pick.
+        allCommits = [];
+        selectedHashes = new Set();
+        document.getElementById('commit-section').style.display = 'none';
+        document.getElementById('action-section').style.display = 'none';
       } else {
         showStatus('❌ ' + (r.error || 'Cherry-pick failed.'), 'error');
       }
@@ -855,6 +920,12 @@ window.addEventListener('message', e => {
       break;
     case 'commitFilesLoaded':
       renderFileChanges(msg.hash, msg.files);
+      break;
+    case 'branchesLoaded':
+      ALL_BRANCHES = msg.branches;
+      break;
+    case 'presetTarget':
+      setSSValue('targetBranch', msg.branch);
       break;
   }
 });
@@ -980,8 +1051,15 @@ function renderFileChanges(hash, files) {
   });
 }
 
-// Init searchable dropdowns on load
+function refreshBranches() {
+  showStatus('Refreshing branch list from origin...', 'progress');
+  vscode.postMessage({ command: 'getBranches' });
+}
+
+// Init searchable dropdowns on load, and immediately re-fetch the branch
+// list in case anything changed on origin since this panel was last opened.
 initSearchSelects();
+vscode.postMessage({ command: 'getBranches' });
 </script>
 </body>
 </html>`;

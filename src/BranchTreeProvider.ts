@@ -56,7 +56,7 @@ class BranchItem extends vscode.TreeItem {
     this.command = {
       command: 'cherry-picker.open',
       title: 'Open Cherry Picker',
-      arguments: [],
+      arguments: [branchName],
     };
   }
 }
